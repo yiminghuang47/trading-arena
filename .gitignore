@@ -1,0 +1,11 @@
+build/
+*.exe
+*.o
+*.obj
+*.pdb
+*.wal
+.cache/
+compile_commands.json
+
+# Claude Code personal settings (not shared)
+.claude/settings.local.json

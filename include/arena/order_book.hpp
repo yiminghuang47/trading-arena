@@ -2,12 +2,14 @@
 
 #include <cstdint>
 #include <vector> 
+#include <functional>
 #include "arena/types.hpp"
 #include "arena/protocol.hpp"
 
 namespace arena{
     class MatchingEngine{
         public:
+        using ReportSink = std::function<void(BotId owner, const wire::ExecReport&)>;
         explicit MatchingEngine(size_t max_orders){
             pool_.resize(max_orders);
             bid_levels_.resize(kPriceLevels);
@@ -25,6 +27,17 @@ namespace arena{
         bool crossed() const noexcept { 
             if (best_bid_ == kNoPrice || best_ask_ == kNoPrice) return false;
             return best_bid_ >= best_ask_; 
+        }
+        void set_report_sink(ReportSink s){
+            on_report_ = std::move(s);
+        }
+        
+        void submit(BotId owner, const wire::InboundOrder& msg) {
+            switch (msg.msg_type) {
+                case wire::MsgType::New: handle_new(owner, msg); break;
+                case wire::MsgType::Cancel: break;
+                case wire::MsgType::Modify: break;
+            }
         }
 
         private:
@@ -55,6 +68,8 @@ namespace arena{
         Price best_bid_ = kNoPrice; 
         Price best_ask_ = kNoPrice;
         ExSeq ex_seq_ = 0;
+
+        ReportSink on_report_;
 
 
         int32_t alloc_order(){
@@ -107,5 +122,58 @@ namespace arena{
             }
             lvl.total -= o.qty;
         }
+
+        void advance_best(Side side){
+            // update best price
+            if (side == Side::Bid){
+                while(best_bid_ >= 0 && bid_levels_[best_bid_].total == 0){
+                    best_bid_--;
+                }
+                if (best_bid_ < 0) best_bid_ = kNoPrice;
+            }
+            else{
+                while(best_ask_ < kPriceLevels && ask_levels_[best_ask_].total == 0){
+                    best_ask_++;
+                }
+                if (best_ask_ == kPriceLevels) best_ask_ = kNoPrice;
+            }
+        }
+        void on_rest(Side side, Price px){
+            // update best price
+            if(side == Side::Bid && (best_bid_ == kNoPrice || px > best_bid_)){
+                best_bid_ = px;
+            }
+            if(side == Side::Ask && (best_ask_ == kNoPrice || px < best_ask_)){
+                best_ask_ = px;
+            }
+        }
+
+        void emit(BotId owner, wire::ReportType type, 
+                OrderId id, Side side, Price px, Qty qty) {
+            if (on_report_){
+                on_report_(owner, {type, ++ex_seq_, id, side, px, qty});
+            }
+        }
+
+        void handle_new(BotId owner, const wire::InboundOrder& msg){
+            const bool is_market = (msg.price == kNoPrice); // market order
+            if( msg.qty ==0 || (!is_market && (msg.price < 0 || msg.price >= kPriceLevels))){
+                emit(owner, wire::ReportType::Reject, msg.order_id, msg.side, msg.price, msg.qty);
+                return;
+            }
+            // assume GTC for now
+            int32_t idx = alloc_order();
+            if(idx==-1){
+                emit(owner, wire::ReportType::Reject, msg.order_id, msg.side, msg.price, msg.qty);
+                return;
+            }
+            pool_[idx] = Order{msg.order_id, owner, msg.side, msg.price, msg.qty, -1, -1};
+            Level& lvl = (msg.side == Side::Bid) ? bid_levels_[msg.price] : ask_levels_[msg.price];
+            push_back(lvl, idx);
+            on_rest(msg.side, msg.price);
+            emit(owner, wire::ReportType::Ack, msg.order_id, msg.side, msg.price, msg.qty);
+        }
+
+
     };
 }

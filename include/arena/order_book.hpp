@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <vector> 
 #include <functional>
+#include <limits>
+#include <algorithm>   
 #include "arena/types.hpp"
 #include "arena/protocol.hpp"
 
@@ -70,6 +72,7 @@ namespace arena{
         ExSeq ex_seq_ = 0;
 
         ReportSink on_report_;
+
 
 
         int32_t alloc_order(){
@@ -157,22 +160,101 @@ namespace arena{
 
         void handle_new(BotId owner, const wire::InboundOrder& msg){
             const bool is_market = (msg.price == kNoPrice); // market order
-            if( msg.qty ==0 || (!is_market && (msg.price < 0 || msg.price >= kPriceLevels))){
+            if(msg.qty ==0 || (!is_market && (msg.price < 0 || msg.price >= kPriceLevels))){
                 emit(owner, wire::ReportType::Reject, msg.order_id, msg.side, msg.price, msg.qty);
                 return;
             }
+            Qty remaining = msg.qty;
+            // match order
+            if(msg.side == Side::Bid){
+                remaining = match_buy(owner, msg, remaining, is_market);
+
+            }
+            else{
+                remaining = match_sell(owner, msg, remaining, is_market);
+            }
+
+            // rest order
             // assume GTC for now
             int32_t idx = alloc_order();
             if(idx==-1){
                 emit(owner, wire::ReportType::Reject, msg.order_id, msg.side, msg.price, msg.qty);
                 return;
             }
-            pool_[idx] = Order{msg.order_id, owner, msg.side, msg.price, msg.qty, -1, -1};
+            pool_[idx] = Order{msg.order_id, owner, msg.side, msg.price, remaining, -1, -1};
             Level& lvl = (msg.side == Side::Bid) ? bid_levels_[msg.price] : ask_levels_[msg.price];
             push_back(lvl, idx);
             on_rest(msg.side, msg.price);
-            emit(owner, wire::ReportType::Ack, msg.order_id, msg.side, msg.price, msg.qty);
+            emit(owner, wire::ReportType::Ack, msg.order_id, msg.side, msg.price, remaining);
         }
+
+        Qty match_sell(BotId owner, const wire::InboundOrder& msg, Qty qty, bool mkt) {
+            const Price limit = mkt ? std::numeric_limits<Price>::min() : msg.price;
+            while(qty > 0 && best_bid_ != kNoPrice && best_bid_ >= limit){
+                Level& lvl = bid_levels_[best_bid_];
+                const Price trade_px = best_bid_;
+                while(qty > 0 && lvl.head != -1){
+                    int32_t hidx = lvl.head;
+                    Order& resting = pool_[hidx];
+                    const Qty traded = std::min(qty, resting.qty);
+                    emit(owner, wire::ReportType::Fill, msg.order_id, Side::Ask, trade_px, traded);
+                    emit(resting.owner, wire::ReportType::Fill, resting.id, Side::Bid, trade_px, traded);
+                    qty -= traded;
+                    resting.qty -= traded;
+                    lvl.total -= traded;
+                    if(resting.qty==0){
+                        // pop
+                        lvl.head = resting.next;
+                        if(lvl.head == -1){
+                            lvl.tail = -1;
+                        }
+                        else{
+                            pool_[lvl.head].prev = -1;
+                        }
+                        free_order(hidx);
+                    }
+                }
+                if(lvl.head == -1){
+                    advance_best(Side::Bid);
+                }
+            }
+            return qty;
+        }
+
+        Qty match_buy(BotId owner, const wire::InboundOrder& msg, Qty qty, bool mkt) {
+            const Price limit = mkt ? std::numeric_limits<Price>::max() : msg.price;
+            while(qty > 0 && best_ask_ != kNoPrice && best_ask_ <= limit){
+                Level& lvl = ask_levels_[best_ask_];
+                const Price trade_px = best_ask_;
+                while(qty > 0 && lvl.head != -1){
+                    int32_t hidx = lvl.head;
+                    Order& resting = pool_[hidx];
+                    const Qty traded = std::min(qty, resting.qty);
+                    emit(owner, wire::ReportType::Fill, msg.order_id, Side::Bid, trade_px, traded);
+                    emit(resting.owner, wire::ReportType::Fill, resting.id, Side::Ask, trade_px, traded);
+                    qty -= traded;
+                    resting.qty -= traded;
+                    lvl.total -= traded;
+                    if(resting.qty==0){
+                        // pop
+                        lvl.head = resting.next;
+                        if(lvl.head == -1){
+                            lvl.tail = -1;
+                        }
+                        else{
+                            pool_[lvl.head].prev = -1;
+                        }
+                        free_order(hidx);
+                    }
+                }
+                if(lvl.head == -1){
+                    advance_best(Side::Ask);
+                }
+                
+            }
+            return qty;
+        }
+
 
 
     };

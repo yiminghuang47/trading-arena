@@ -173,6 +173,13 @@ namespace arena{
             else{
                 remaining = match_sell(owner, msg, remaining, is_market);
             }
+            if (remaining == 0) return;
+            // market order never rest
+            // IOC cancels unfilled orders
+            if(is_market || msg.tif == Tif::IOC){
+                emit(owner, wire::ReportType::Cancelled, msg.order_id, msg.side, msg.price, remaining);
+                return;
+            }
 
             // rest order
             // assume GTC for now

@@ -46,5 +46,24 @@ int main(){
         printf("  best_bid=%d best_ask=%d\n", eng.best_bid(), eng.best_ask());
     }
 
+    // Case 4: cancel a resting order; best price should walk to the next level.
+    printf("== case 4: cancel best bid ==\n");
+    {
+        MatchingEngine eng = make_engine();
+        eng.submit(7, {wire::MsgType::New, 1, 100, Side::Bid, 500, 5, Tif::GTC});
+        eng.submit(7, {wire::MsgType::New, 2, 101, Side::Bid, 499, 4, Tif::GTC});
+        printf("  before cancel: best_bid=%d resting=%zu\n", eng.best_bid(), eng.resting_orders());
+        // cancel order 100 (the 500 bid) -> best_bid should drop to 499
+        eng.submit(7, {wire::MsgType::Cancel, 3, 100, Side::Bid, 0, 0, Tif::GTC});
+        printf("  after cancel:  best_bid=%d resting=%zu\n", eng.best_bid(), eng.resting_orders());
+    }
+
+    // Case 5: cancel an unknown order id -> Reject.
+    printf("== case 5: cancel unknown id ==\n");
+    {
+        MatchingEngine eng = make_engine();
+        eng.submit(7, {wire::MsgType::Cancel, 1, 999, Side::Bid, 0, 0, Tif::GTC});
+    }
+
     return 0;
 }

@@ -4,15 +4,16 @@
 #include <vector> 
 #include <functional>
 #include <limits>
-#include <algorithm>   
+#include <algorithm>
 #include "arena/types.hpp"
 #include "arena/protocol.hpp"
+#include "arena/open_addr_map.hpp"
 
 namespace arena{
     class MatchingEngine{
         public:
         using ReportSink = std::function<void(BotId owner, const wire::ExecReport&)>;
-        explicit MatchingEngine(size_t max_orders){
+        explicit MatchingEngine(size_t max_orders) : id_map_(max_orders) {
             pool_.resize(max_orders);
             bid_levels_.resize(kPriceLevels);
             ask_levels_.resize(kPriceLevels);
@@ -26,7 +27,11 @@ namespace arena{
         }
         Price best_bid() const noexcept { return best_bid_; }
         Price best_ask() const noexcept { return best_ask_; }
-        bool crossed() const noexcept { 
+        Qty   bid_qty_at(Price p) const { return bid_levels_[p].total; }
+        Qty   ask_qty_at(Price p) const { return ask_levels_[p].total; }
+        ExSeq exchange_seq() const noexcept { return ex_seq_; }
+        std::size_t resting_orders() const noexcept { return id_map_.size(); }
+        bool crossed() const noexcept {
             if (best_bid_ == kNoPrice || best_ask_ == kNoPrice) return false;
             return best_bid_ >= best_ask_; 
         }
@@ -37,7 +42,7 @@ namespace arena{
         void submit(BotId owner, const wire::InboundOrder& msg) {
             switch (msg.msg_type) {
                 case wire::MsgType::New: handle_new(owner, msg); break;
-                case wire::MsgType::Cancel: break;
+                case wire::MsgType::Cancel: handle_cancel(owner, msg); break;
                 case wire::MsgType::Modify: break;
             }
         }
@@ -65,13 +70,19 @@ namespace arena{
         };
         std::vector<Order> pool_;
         std::vector<int32_t> free_list_; // available slots
+        OpenAddrMap id_map_;             // key_of(owner, order_id) -> pool index
         std::vector<Level> bid_levels_;
         std::vector<Level> ask_levels_;
-        Price best_bid_ = kNoPrice; 
+        Price best_bid_ = kNoPrice;
         Price best_ask_ = kNoPrice;
         ExSeq ex_seq_ = 0;
 
         ReportSink on_report_;
+
+        // Namespace client order ids by owner so two bots may reuse the same id.
+        static std::uint64_t key_of(BotId owner, OrderId id) {
+            return (static_cast<std::uint64_t>(owner) << 48) ^ id;
+        }
 
 
 
@@ -192,7 +203,31 @@ namespace arena{
             Level& lvl = (msg.side == Side::Bid) ? bid_levels_[msg.price] : ask_levels_[msg.price];
             push_back(lvl, idx);
             on_rest(msg.side, msg.price);
+            id_map_.insert(key_of(owner, msg.order_id), idx);
             emit(owner, wire::ReportType::Ack, msg.order_id, msg.side, msg.price, remaining);
+        }
+
+        void handle_cancel(BotId owner, const wire::InboundOrder& msg){
+            const std::uint64_t k = key_of(owner, msg.order_id);
+            const int32_t idx = id_map_.find(k);
+            if(idx == OpenAddrMap::kAbsent){
+                // unknown / already-filled order 
+                emit(owner, wire::ReportType::Reject, msg.order_id, msg.side, msg.price, 0);
+                return;
+            }
+            Order& o = pool_[idx];
+            const Side side = o.side;
+            const Price px = o.price;
+            Level& lvl = (side == Side::Bid) ? bid_levels_[px] : ask_levels_[px];
+            unlink(lvl, idx);
+            id_map_.erase(k);
+            free_order(idx);
+            // if we just emptied the best level, walk to the next one
+            if(lvl.total == 0){
+                if(side == Side::Bid && px == best_bid_) advance_best(Side::Bid);
+                if(side == Side::Ask && px == best_ask_) advance_best(Side::Ask);
+            }
+            emit(owner, wire::ReportType::Cancelled, msg.order_id, side, px, 0);
         }
 
         Qty match_sell(BotId owner, const wire::InboundOrder& msg, Qty qty, bool mkt) {
@@ -218,6 +253,7 @@ namespace arena{
                         else{
                             pool_[lvl.head].prev = -1;
                         }
+                        id_map_.erase(key_of(resting.owner, resting.id));
                         free_order(hidx);
                     }
                 }
@@ -251,6 +287,7 @@ namespace arena{
                         else{
                             pool_[lvl.head].prev = -1;
                         }
+                        id_map_.erase(key_of(resting.owner, resting.id));
                         free_order(hidx);
                     }
                 }

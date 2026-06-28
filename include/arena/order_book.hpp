@@ -43,7 +43,7 @@ namespace arena{
             switch (msg.msg_type) {
                 case wire::MsgType::New: handle_new(owner, msg); break;
                 case wire::MsgType::Cancel: handle_cancel(owner, msg); break;
-                case wire::MsgType::Modify: break;
+                case wire::MsgType::Modify: handle_modify(owner, msg); break;
             }
         }
 
@@ -207,27 +207,42 @@ namespace arena{
             emit(owner, wire::ReportType::Ack, msg.order_id, msg.side, msg.price, remaining);
         }
 
-        void handle_cancel(BotId owner, const wire::InboundOrder& msg){
-            const std::uint64_t k = key_of(owner, msg.order_id);
-            const int32_t idx = id_map_.find(k);
-            if(idx == OpenAddrMap::kAbsent){
-                // unknown / already-filled order 
-                emit(owner, wire::ReportType::Reject, msg.order_id, msg.side, msg.price, 0);
-                return;
-            }
+        // Remove a resting order from the book
+        void remove_resting(int32_t idx){
             Order& o = pool_[idx];
             const Side side = o.side;
             const Price px = o.price;
             Level& lvl = (side == Side::Bid) ? bid_levels_[px] : ask_levels_[px];
             unlink(lvl, idx);
-            id_map_.erase(k);
+            id_map_.erase(key_of(o.owner, o.id));
             free_order(idx);
-            // if we just emptied the best level, walk to the next one
             if(lvl.total == 0){
                 if(side == Side::Bid && px == best_bid_) advance_best(Side::Bid);
                 if(side == Side::Ask && px == best_ask_) advance_best(Side::Ask);
             }
+        }
+
+        void handle_cancel(BotId owner, const wire::InboundOrder& msg){
+            const int32_t idx = id_map_.find(key_of(owner, msg.order_id));
+            if(idx == OpenAddrMap::kAbsent){
+                // unknown / already-filled order
+                emit(owner, wire::ReportType::Reject, msg.order_id, msg.side, msg.price, 0);
+                return;
+            }
+            // capture side/price before the slot is freed, for the report
+            const Side side = pool_[idx].side;
+            const Price px = pool_[idx].price;
+            remove_resting(idx);
             emit(owner, wire::ReportType::Cancelled, msg.order_id, side, px, 0);
+        }
+
+        void handle_modify(BotId owner, const wire::InboundOrder& msg){
+            // remove the old resting order then place a new one
+            const int32_t idx = id_map_.find(key_of(owner, msg.order_id));
+            if(idx != OpenAddrMap::kAbsent) remove_resting(idx);
+            wire::InboundOrder repl = msg;
+            repl.msg_type = wire::MsgType::New;
+            handle_new(owner, repl);
         }
 
         Qty match_sell(BotId owner, const wire::InboundOrder& msg, Qty qty, bool mkt) {

@@ -65,5 +65,27 @@ int main(){
         eng.submit(7, {wire::MsgType::Cancel, 1, 999, Side::Bid, 0, 0, Tif::GTC});
     }
 
+    // Case 6: modify a resting bid to a new price (cancel-replace).
+    printf("== case 6: modify reprice ==\n");
+    {
+        MatchingEngine eng = make_engine();
+        eng.submit(7, {wire::MsgType::New, 1, 100, Side::Bid, 500, 5, Tif::GTC});
+        printf("  before: best_bid=%d resting=%zu\n", eng.best_bid(), eng.resting_orders());
+        eng.submit(7, {wire::MsgType::Modify, 2, 100, Side::Bid, 502, 5, Tif::GTC});
+        printf("  after:  best_bid=%d resting=%zu\n", eng.best_bid(), eng.resting_orders());
+    }
+
+    // Case 7: modify that crosses the book -> the replacement fills instead of resting.
+    printf("== case 7: modify that crosses ==\n");
+    {
+        MatchingEngine eng = make_engine();
+        eng.submit(8, {wire::MsgType::New, 1, 200, Side::Ask, 505, 5, Tif::GTC}); // resting ask
+        eng.submit(7, {wire::MsgType::New, 2, 100, Side::Bid, 500, 5, Tif::GTC}); // resting bid
+        // reprice the bid up to 505 -> it now crosses the ask and trades
+        eng.submit(7, {wire::MsgType::Modify, 3, 100, Side::Bid, 505, 5, Tif::GTC});
+        printf("  best_bid=%d best_ask=%d resting=%zu\n",
+               eng.best_bid(), eng.best_ask(), eng.resting_orders());
+    }
+
     return 0;
 }

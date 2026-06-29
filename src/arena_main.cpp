@@ -75,6 +75,21 @@ int main(){
         printf("  after:  best_bid=%d resting=%zu\n", eng.best_bid(), eng.resting_orders());
     }
 
+    // Case 8: market data broadcast — top-of-book after each message, last trade on a fill.
+    printf("== case 8: market data ==\n");
+    {
+        MatchingEngine eng(1 << 16);
+        eng.set_market_sink([](const wire::MarketUpdate& md) {
+            printf("  md: seq=%llu bid=%d(%u) ask=%d(%u) last=%d(%u)\n",
+                   static_cast<unsigned long long>(md.exchange_seq),
+                   md.best_bid, md.bid_qty, md.best_ask, md.ask_qty,
+                   md.last_trade_px, md.last_trade_qty);
+        });
+        eng.submit(1, {wire::MsgType::New, 1, 100, Side::Bid, 500, 5, Tif::GTC}); // md: bid 500
+        eng.submit(2, {wire::MsgType::New, 1, 200, Side::Ask, 505, 4, Tif::GTC}); // md: 500/505
+        eng.submit(3, {wire::MsgType::New, 2, 201, Side::Ask, 500, 3, Tif::GTC}); // trade @ 500
+    }
+
     // Case 7: modify that crosses the book -> the replacement fills instead of resting.
     printf("== case 7: modify that crosses ==\n");
     {

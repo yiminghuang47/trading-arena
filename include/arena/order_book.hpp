@@ -13,6 +13,7 @@ namespace arena{
     class MatchingEngine{
         public:
         using ReportSink = std::function<void(BotId owner, const wire::ExecReport&)>;
+        using MarketSink = std::function<void(const wire::MarketUpdate&)>;
         explicit MatchingEngine(size_t max_orders) : id_map_(max_orders) {
             pool_.resize(max_orders);
             bid_levels_.resize(kPriceLevels);
@@ -38,13 +39,19 @@ namespace arena{
         void set_report_sink(ReportSink s){
             on_report_ = std::move(s);
         }
-        
+        void set_market_sink(MarketSink s){
+            on_market_ = std::move(s);
+        }
+
         void submit(BotId owner, const wire::InboundOrder& msg) {
+            
+            last_trade_qty_ = 0;
             switch (msg.msg_type) {
                 case wire::MsgType::New: handle_new(owner, msg); break;
                 case wire::MsgType::Cancel: handle_cancel(owner, msg); break;
                 case wire::MsgType::Modify: handle_modify(owner, msg); break;
             }
+            broadcast_market();
         }
 
         private:
@@ -76,8 +83,11 @@ namespace arena{
         Price best_bid_ = kNoPrice;
         Price best_ask_ = kNoPrice;
         ExSeq ex_seq_ = 0;
+        Price last_trade_px_ = kNoPrice;   // set by match_*, read by broadcast_market
+        Qty   last_trade_qty_ = 0;
 
         ReportSink on_report_;
+        MarketSink on_market_;
 
         // Namespace client order ids by owner so two bots may reuse the same id.
         static std::uint64_t key_of(BotId owner, OrderId id) {
@@ -162,11 +172,25 @@ namespace arena{
             }
         }
 
-        void emit(BotId owner, wire::ReportType type, 
+        void emit(BotId owner, wire::ReportType type,
                 OrderId id, Side side, Price px, Qty qty) {
             if (on_report_){
                 on_report_(owner, {type, ++ex_seq_, id, side, px, qty});
             }
+        }
+
+        // Publish top-of-book + the last trade (if any) for this message.
+        void broadcast_market(){
+            if (!on_market_) return;
+            wire::MarketUpdate md{
+                ++ex_seq_,
+                best_bid_,
+                best_bid_ == kNoPrice ? 0u : bid_levels_[best_bid_].total,
+                best_ask_,
+                best_ask_ == kNoPrice ? 0u : ask_levels_[best_ask_].total,
+                last_trade_px_,
+                last_trade_qty_};
+            on_market_(md);
         }
 
         void handle_new(BotId owner, const wire::InboundOrder& msg){
@@ -256,6 +280,8 @@ namespace arena{
                     const Qty traded = std::min(qty, resting.qty);
                     emit(owner, wire::ReportType::Fill, msg.order_id, Side::Ask, trade_px, traded);
                     emit(resting.owner, wire::ReportType::Fill, resting.id, Side::Bid, trade_px, traded);
+                    last_trade_px_ = trade_px;
+                    last_trade_qty_ = traded;
                     qty -= traded;
                     resting.qty -= traded;
                     lvl.total -= traded;
@@ -290,6 +316,8 @@ namespace arena{
                     const Qty traded = std::min(qty, resting.qty);
                     emit(owner, wire::ReportType::Fill, msg.order_id, Side::Bid, trade_px, traded);
                     emit(resting.owner, wire::ReportType::Fill, resting.id, Side::Ask, trade_px, traded);
+                    last_trade_px_ = trade_px;
+                    last_trade_qty_ = traded;
                     qty -= traded;
                     resting.qty -= traded;
                     lvl.total -= traded;

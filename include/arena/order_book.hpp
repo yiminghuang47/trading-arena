@@ -44,7 +44,8 @@ namespace arena{
         }
 
         void submit(BotId owner, const wire::InboundOrder& msg) {
-            
+            // reset the "last trade" for this message; match_* set it on a fill
+            last_trade_px_ = kNoPrice;
             last_trade_qty_ = 0;
             switch (msg.msg_type) {
                 case wire::MsgType::New: handle_new(owner, msg); break;

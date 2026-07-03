@@ -1,6 +1,7 @@
 // Wires the matching engine, accounting and reference bots together, runs a
 // fixed-horizon game on a hidden terminal value V, settles P&L and prints a
 // leaderboard. Pass --cases to run the engine demo/smoke cases instead.
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -46,6 +47,9 @@ class Arena final : public OrderEntry {
 
         add<NoiseBot>(master(), est());
         add<NoiseBot>(master(), est());
+        add<NaiveMM>(est());
+        add<InventoryMM>(est());
+        add<SniperBot>(est());
 
         cash_.assign(bots_.size(), 0);
         pos_.assign(bots_.size(), 0);
@@ -119,6 +123,46 @@ class Arena final : public OrderEntry {
     std::uint64_t buy_volume_ = 0;
     std::uint64_t sell_volume_ = 0;
 };
+
+GameResult play(std::uint64_t seed, int rounds) {
+    Arena a(seed, rounds);
+    return a.run();
+}
+
+// Run many games on consecutive seeds; print each bot's mean P&L, stddev, and a
+// Sharpe-like mean/stddev ratio -- skill separated from single-game luck.
+void run_aggregate(std::uint64_t seed, int rounds, const GameResult& sample) {
+    const int n_games = 200;
+    const std::size_t nb = sample.bots.size();
+    std::vector<double> sum(nb, 0.0), sumsq(nb, 0.0);
+    for (int g = 0; g < n_games; ++g) {
+        GameResult gr = play(seed + static_cast<std::uint64_t>(g), rounds);
+        for (std::size_t i = 0; i < nb; ++i) {
+            const double p = static_cast<double>(gr.bots[i].pnl);
+            sum[i] += p;
+            sumsq[i] += p * p;
+        }
+    }
+    std::vector<int> agg(nb);
+    for (std::size_t i = 0; i < nb; ++i) agg[i] = static_cast<int>(i);
+    auto mean = [&](int i) { return sum[i] / n_games; };
+    std::sort(agg.begin(), agg.end(), [&](int x, int y) { return mean(x) > mean(y); });
+
+    std::printf("\nAggregate over %d games (seeds %llu..%llu)\n", n_games,
+                static_cast<unsigned long long>(seed),
+                static_cast<unsigned long long>(seed + n_games - 1));
+    std::printf("------------------------------------------------------------\n");
+    std::printf("%-4s %-10s %12s %12s %8s\n", "rank", "bot", "mean_pnl", "stddev", "sharpe");
+    int rank = 1;
+    for (int i : agg) {
+        const double m = mean(i);
+        const double var = sumsq[i] / n_games - m * m;
+        const double sd = var > 0 ? std::sqrt(var) : 0.0;
+        const double sharpe = sd > 0 ? m / sd : 0.0;
+        std::printf("%-4d %-10s %12.1f %12.1f %8.2f\n", rank++,
+                    sample.bots[i].name.c_str(), m, sd, sharpe);
+    }
+}
 
 // Print the per-bot leaderboard, sorted by P&L descending.
 void print_leaderboard(const GameResult& res) {
@@ -224,9 +268,11 @@ void demo_cases() {
 int main(int argc, char** argv) {
     std::uint64_t seed = 42;
     int rounds = 3000;
+    bool quiet = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--cases") { demo_cases(); return 0; }
+        else if (a == "--quiet") quiet = true;
         else if (a == "--seed" && i + 1 < argc) seed = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--rounds" && i + 1 < argc) rounds = std::atoi(argv[++i]);
     }
@@ -247,5 +293,7 @@ int main(int argc, char** argv) {
                 a.buy_volume() == a.sell_volume() ? "ok" : "FAIL");
     std::printf("------------------------------------------------------------\n");
     print_leaderboard(res);
+
+    if (!quiet) run_aggregate(seed, rounds, res);
     return 0;
 }

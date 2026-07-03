@@ -5,6 +5,7 @@
 #pragma once
 
 #include <algorithm>
+#include <optional>
 #include <random>
 
 #include "arena/bot.hpp"
@@ -46,4 +47,94 @@ namespace arena{
         Price est_;
         wire::MarketUpdate md_{};
     };
-}  
+
+    // Quotes a fixed spread around its value signal; no inventory management
+    // beyond the hard position cap. A "textbook but naive" market maker.
+    class NaiveMM final : public Bot{
+        public:
+        NaiveMM(BotId id, OrderEntry* oe, Price est, Price half_spread = 2, Qty size = 3)
+            : Bot(id, oe), est_(est), half_(half_spread), size_(size) {}
+
+        const char* name() const override { return "naive_mm"; }
+
+        void act() override {
+            if (bid_id_) cancel(*bid_id_);
+            if (ask_id_) cancel(*ask_id_);
+            // Fixed spread around the value signal; suppress the side that would
+            // push us past the position limit (else inventory runs away).
+            if (position() < kPosLimit)
+                bid_id_ = submit(Side::Bid, clamp_px(est_ - half_), size_, Tif::GTC);
+            else
+                bid_id_.reset();
+            if (position() > -kPosLimit)
+                ask_id_ = submit(Side::Ask, clamp_px(est_ + half_), size_, Tif::GTC);
+            else
+                ask_id_.reset();
+        }
+
+        private:
+        Price est_, half_;
+        Qty   size_;
+        std::optional<OrderId> bid_id_, ask_id_;
+    };
+
+    // Skews its reservation price against inventory so quotes mean-revert
+    // position toward flat (Avellaneda-Stoikov in spirit). The "good" bot.
+    class InventoryMM final : public Bot{
+        public:
+        InventoryMM(BotId id, OrderEntry* oe, Price est, Price half_spread = 2, Qty size = 3)
+            : Bot(id, oe), est_(est), half_(half_spread), size_(size) {}
+
+        const char* name() const override { return "inv_mm"; }
+
+        void act() override {
+            if (bid_id_) cancel(*bid_id_);
+            if (ask_id_) cancel(*ask_id_);
+            // Long -> quote lower to sell; short -> quote higher to buy.
+            const Price skew = static_cast<Price>(position()) / 4;
+            const Price center = est_ - skew;
+            if (position() < kPosLimit)
+                bid_id_ = submit(Side::Bid, clamp_px(center - half_), size_, Tif::GTC);
+            else
+                bid_id_.reset();
+            if (position() > -kPosLimit)
+                ask_id_ = submit(Side::Ask, clamp_px(center + half_), size_, Tif::GTC);
+            else
+                ask_id_.reset();
+        }
+
+        private:
+        Price est_, half_;
+        Qty   size_;
+        std::optional<OrderId> bid_id_, ask_id_;
+    };
+
+    // Lifts/hits stale quotes when they cross its value signal -- picks off
+    // mispriced resting orders left by the market makers.
+    class SniperBot final : public Bot{
+        public:
+        SniperBot(BotId id, OrderEntry* oe, Price est, Price edge = 2, Qty size = 5)
+            : Bot(id, oe), est_(est), edge_(edge), size_(size) {}
+
+        const char* name() const override { return "sniper"; }
+        void on_market_data(const wire::MarketUpdate& md) override { md_ = md; }
+
+        void act() override {
+            // Lift a cheap ask (priced below fair) if we have room to go long.
+            if (md_.best_ask != kNoPrice && md_.best_ask < est_ - edge_ &&
+                position() < kPosLimit) {
+                submit(Side::Bid, md_.best_ask, std::min<Qty>(size_, md_.ask_qty), Tif::IOC);
+            }
+            // Hit a rich bid (priced above fair) if we have room to go short.
+            if (md_.best_bid != kNoPrice && md_.best_bid > est_ + edge_ &&
+                position() > -kPosLimit) {
+                submit(Side::Ask, md_.best_bid, std::min<Qty>(size_, md_.bid_qty), Tif::IOC);
+            }
+        }
+
+        private:
+        Price est_, edge_;
+        Qty   size_;
+        wire::MarketUpdate md_{};
+    };
+}

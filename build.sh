@@ -9,7 +9,9 @@ echo "Building arena..."
 g++ "${FLAGS[@]}" src/arena_main.cpp -o build/arena
 echo "Building tests..."
 g++ "${FLAGS[@]}" tests/test_book.cpp -o build/test_book
-echo "Build OK -> build/"
+echo "Building bench..."
+g++ "${FLAGS[@]}" src/bench_main.cpp -o build/bench
+echo "Build OK -> build/  (run the benchmark with ./build/bench)"
 
 if [[ "${1:-}" == "--run" ]]; then
   echo; echo "=== tests ==="

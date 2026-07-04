@@ -80,6 +80,20 @@ class Arena final : public OrderEntry {
     std::uint16_t num_bots() const { return static_cast<std::uint16_t>(bots_.size()); }
     std::uint64_t digest() const { return digest_.h; }
 
+    GameResult build_result() const {
+        GameResult res;
+        res.value = value_;
+        res.volume = buy_volume_;  // == sell_volume_ by conservation
+        res.messages = engine_.exchange_seq();
+        for (std::size_t i = 0; i < bots_.size(); ++i) {
+            // Settle open inventory at the revealed terminal value V.
+            const std::int64_t pnl =
+                cash_[i] + static_cast<std::int64_t>(pos_[i]) * value_;
+            res.bots.push_back({bots_[i]->name(), pos_[i], cash_[i], pnl});
+        }
+        return res;
+    }
+
     GameResult run() {
         for (int r = 0; r < rounds_; ++r)
             for (auto& b : bots_) b->act();
@@ -112,20 +126,6 @@ class Arena final : public OrderEntry {
             }
         }
         bots_[owner]->deliver_execution(r);
-    }
-
-    GameResult build_result() const {
-        GameResult res;
-        res.value = value_;
-        res.volume = buy_volume_;  // == sell_volume_ by conservation
-        res.messages = engine_.exchange_seq();
-        for (std::size_t i = 0; i < bots_.size(); ++i) {
-            // Settle open inventory at the revealed terminal value V.
-            const std::int64_t pnl =
-                cash_[i] + static_cast<std::int64_t>(pos_[i]) * value_;
-            res.bots.push_back({bots_[i]->name(), pos_[i], cash_[i], pnl});
-        }
-        return res;
     }
 
     MatchingEngine engine_;
@@ -178,6 +178,34 @@ void run_aggregate(std::uint64_t seed, int rounds, const GameResult& sample) {
         std::printf("%-4d %-10s %12.1f %12.1f %8.2f\n", rank++,
                     sample.bots[i].name.c_str(), m, sd, sharpe);
     }
+}
+
+void print_leaderboard(const GameResult& res);  // defined below
+
+// Replay a recorded game from its WAL and verify byte-identical output.
+int replay(const std::string& path) {
+    WalReader wal(path);
+    Arena a(wal.header.seed, 0);  // rebuild bots/V from the seed; don't run them
+    for (const auto& rec : wal.records) a.feed(rec);
+    GameResult res = a.build_result();
+    const bool digest_ok = a.digest() == wal.header.out_digest;
+    const bool value_ok = a.value() == wal.header.value;
+
+    std::printf("Replay of %s\n", path.c_str());
+    std::printf("------------------------------------------------------------\n");
+    std::printf("seed .................... %llu\n",
+                static_cast<unsigned long long>(wal.header.seed));
+    std::printf("records replayed ........ %llu\n",
+                static_cast<unsigned long long>(wal.header.record_count));
+    std::printf("Hidden value V .......... %d  (matches log: %s)\n", res.value,
+                value_ok ? "ok" : "FAIL");
+    std::printf("Outbound digest ......... 0x%016llx (expected 0x%016llx)\n",
+                static_cast<unsigned long long>(a.digest()),
+                static_cast<unsigned long long>(wal.header.out_digest));
+    std::printf("Replay byte-identical ... %s\n", digest_ok ? "ok" : "FAIL");
+    std::printf("------------------------------------------------------------\n");
+    print_leaderboard(res);
+    return (digest_ok && value_ok) ? 0 : 1;
 }
 
 // Print the per-bot leaderboard, sorted by P&L descending.
@@ -293,6 +321,7 @@ int main(int argc, char** argv) {
         else if (a == "--seed" && i + 1 < argc) seed = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--rounds" && i + 1 < argc) rounds = std::atoi(argv[++i]);
         else if (a == "--wal" && i + 1 < argc) wal_path = argv[++i];
+        else if (a == "--replay" && i + 1 < argc) return replay(argv[++i]);
     }
 
     Arena a(seed, rounds);

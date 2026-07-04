@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
@@ -13,6 +14,7 @@
 
 #include "arena/order_book.hpp"
 #include "arena/reference_bots.hpp"
+#include "arena/wal.hpp"
 
 using namespace arena;
 
@@ -55,16 +57,28 @@ class Arena final : public OrderEntry {
         pos_.assign(bots_.size(), 0);
 
         engine_.set_report_sink([this](BotId owner, const wire::ExecReport& r) {
+            digest_.update(r);
             on_report(owner, r);
         });
         engine_.set_market_sink([this](const wire::MarketUpdate& md) {
+            digest_.update(md);
             for (auto& b : bots_) b->on_market_data(md);
         });
     }
 
+    // OrderEntry: route a bot's message into the engine, logging it first if
+    // recording (write-ahead: the log gets the event before the engine does).
     void send(BotId owner, const wire::InboundOrder& msg) override {
+        if (wal_) wal_->append(owner, msg);
         engine_.submit(owner, msg);
     }
+
+    // Replay path: feed one recorded event straight to the engine (bypass bots).
+    void feed(const WalRecord& rec) { engine_.submit(rec.owner, rec.msg); }
+
+    void set_wal(WalWriter* w) { wal_ = w; }
+    std::uint16_t num_bots() const { return static_cast<std::uint16_t>(bots_.size()); }
+    std::uint64_t digest() const { return digest_.h; }
 
     GameResult run() {
         for (int r = 0; r < rounds_; ++r)
@@ -122,6 +136,8 @@ class Arena final : public OrderEntry {
     std::vector<std::int32_t> pos_;
     std::uint64_t buy_volume_ = 0;
     std::uint64_t sell_volume_ = 0;
+    WalWriter* wal_ = nullptr;
+    Digest     digest_;
 };
 
 GameResult play(std::uint64_t seed, int rounds) {
@@ -130,7 +146,7 @@ GameResult play(std::uint64_t seed, int rounds) {
 }
 
 // Run many games on consecutive seeds; print each bot's mean P&L, stddev, and a
-// Sharpe-like mean/stddev ratio -- skill separated from single-game luck.
+// Sharpe-like mean/stddev ratio 
 void run_aggregate(std::uint64_t seed, int rounds, const GameResult& sample) {
     const int n_games = 200;
     const std::size_t nb = sample.bots.size();
@@ -263,22 +279,30 @@ void demo_cases() {
     }
 }
 
-}  // namespace
+}  
 
 int main(int argc, char** argv) {
     std::uint64_t seed = 42;
     int rounds = 3000;
     bool quiet = false;
+    std::string wal_path;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--cases") { demo_cases(); return 0; }
         else if (a == "--quiet") quiet = true;
         else if (a == "--seed" && i + 1 < argc) seed = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--rounds" && i + 1 < argc) rounds = std::atoi(argv[++i]);
+        else if (a == "--wal" && i + 1 < argc) wal_path = argv[++i];
     }
 
     Arena a(seed, rounds);
+    std::optional<WalWriter> wal;
+    if (!wal_path.empty()) {
+        wal.emplace(wal_path, seed, a.value(), a.num_bots());
+        a.set_wal(&*wal);
+    }
     GameResult res = a.run();
+    if (wal) wal->finish(a.digest());
 
     std::printf("Bot-vs-Bot Trading Arena  (seed=%llu  rounds=%d)\n",
                 static_cast<unsigned long long>(seed), rounds);
@@ -291,6 +315,11 @@ int main(int argc, char** argv) {
     std::printf("Invariant: book not crossed ... %s\n", a.crossed() ? "FAIL" : "ok");
     std::printf("Invariant: qty conserved ...... %s\n",
                 a.buy_volume() == a.sell_volume() ? "ok" : "FAIL");
+    std::printf("Outbound digest ......... 0x%016llx\n",
+                static_cast<unsigned long long>(a.digest()));
+    if (wal)
+        std::printf("WAL written ............. %s (%llu records)\n", wal_path.c_str(),
+                    static_cast<unsigned long long>(wal->record_count()));
     std::printf("------------------------------------------------------------\n");
     print_leaderboard(res);
 
